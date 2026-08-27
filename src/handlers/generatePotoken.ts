@@ -1,25 +1,29 @@
-import { potManager } from "../pot.ts";
+import { generatePotoken, PotError } from "../potPool.ts";
+import { coldStartToken } from "../potBinding.ts";
 import type {
   PoTokenRequest,
   PoTokenResponse,
   RequestContext,
 } from "../types.ts";
 
-export async function handleGetPoToken(ctx: RequestContext): Promise<Response> {
-  const { visitorData, videoId, client } = ctx.body as PoTokenRequest;
+const STATUS: Record<PotError["code"], number> = {
+  QUEUE_FULL: 503,
+  TIMEOUT: 504,
+  GENERATION_FAILED: 500,
+};
 
+export async function handleGeneratePotoken(
+  ctx: RequestContext,
+): Promise<Response> {
   try {
-    const potData = await potManager.generatePoToken(
-      visitorData,
-      videoId,
-      client,
-    );
+    const potData = await generatePotoken(ctx.body as PoTokenRequest);
 
     const response: PoTokenResponse = {
       visitorDataToken: potData.visitorDataToken,
       visitorData: potData.visitorData,
       videoIdToken: potData.videoIdToken,
-      coldStartToken: potData.coldStartToken,
+      // Not cached: the packet embeds the current time.
+      coldStartToken: coldStartToken(potData.visitorData),
       expiresAt: potData.expiresAt.toISOString(),
     };
 
@@ -32,7 +36,7 @@ export async function handleGetPoToken(ctx: RequestContext): Promise<Response> {
     return new Response(
       JSON.stringify({ error: e instanceof Error ? e.message : String(e) }),
       {
-        status: 500,
+        status: e instanceof PotError ? STATUS[e.code] : 500,
         headers: { "Content-Type": "application/json" },
       },
     );

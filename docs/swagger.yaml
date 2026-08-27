@@ -87,7 +87,7 @@ paths:
                   resolved_url:
                     type: string
 
-  /get_po_token:
+  /generate_potoken:
     post:
       summary: Generates a YouTube PO Token
       requestBody:
@@ -127,12 +127,35 @@ paths:
                   videoIdToken:
                     type: string
                     description: Video ID binding PoToken
+                  coldStartToken:
+                    type: string
+                    description: >-
+                      Bootstrap token accepted only while a SABR session reports
+                      StreamProtectionStatus=2. Minted per response, never cached.
                   expiresAt:
                     type: string
                     format: date-time
                     description: Token expiration time
         '404':
           description: Failed to generate PO Token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '503':
+          description: PO Token queue is full
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '504':
+          description: PO Token generation timed out
           content:
             application/json:
               schema:

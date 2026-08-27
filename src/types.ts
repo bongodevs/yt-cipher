@@ -49,11 +49,7 @@ export interface PoTokenResponse {
   visitorDataToken: string;
   visitorData: string;
   videoIdToken?: string;
-  /**
-   * Bootstrap token that YouTube accepts only while a SABR session reports
-   * `StreamProtectionStatus=2` (ATTESTATION_PENDING). Minted per response because it embeds the
-   * current time, so it must not be cached.
-   */
+  /** Only valid while a SABR session reports `StreamProtectionStatus=2`. Never cached. */
   coldStartToken?: string;
   expiresAt: string;
 }

@@ -31,6 +31,7 @@ RUN case "$TARGETARCH" in \
     --output server \
     --allow-net --allow-read --allow-write --allow-env \
     --include worker.ts \
+    --include src/potWorker.ts \
     server.ts
 
 RUN mkdir -p /usr/src/app/player_cache && \

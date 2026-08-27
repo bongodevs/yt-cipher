@@ -1,10 +1,11 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { initializeWorkers } from "./src/workerPool.ts";
+import { initializePotWorkers } from "./src/potPool.ts";
 import { initializeCache } from "./src/playerCache.ts";
 import { handleDecryptSignature } from "./src/handlers/decryptSignature.ts";
 import { handleGetSts } from "./src/handlers/getSts.ts";
 import { handleResolveUrl } from "./src/handlers/resolveUrl.ts";
-import { handleGetPoToken } from "./src/handlers/getPoToken.ts";
+import { handleGeneratePotoken } from "./src/handlers/generatePotoken.ts";
 import { withMetrics } from "./src/middleware.ts";
 import { withPlayer } from "./src/middleware/player.ts";
 import { withValidation } from "./src/validation.ts";
@@ -68,6 +69,7 @@ async function baseHandler(req: Request): Promise<Response> {
   }
 
   let handle: (ctx: RequestContext) => Promise<Response>;
+  let needsPlayer = true;
 
   if (pathname === "/decrypt_signature") {
     handle = handleDecryptSignature;
@@ -75,8 +77,9 @@ async function baseHandler(req: Request): Promise<Response> {
     handle = handleGetSts;
   } else if (pathname === "/resolve_url") {
     handle = handleResolveUrl;
-  } else if (pathname === "/get_po_token") {
-    handle = handleGetPoToken;
+  } else if (pathname === "/generate_potoken") {
+    handle = handleGeneratePotoken;
+    needsPlayer = false;
   } else {
     return new Response(JSON.stringify({ error: "Not Found" }), {
       status: 404,
@@ -95,9 +98,9 @@ async function baseHandler(req: Request): Promise<Response> {
   }
   const ctx: RequestContext = { req, body };
 
-  const composedHandler = pathname === "/get_po_token"
-    ? withValidation(withMetrics(handle))
-    : withValidation(withPlayer(withMetrics(handle)));
+  const composedHandler = needsPlayer
+    ? withValidation(withPlayer(withMetrics(handle)))
+    : withValidation(withMetrics(handle));
   return await composedHandler(ctx);
 }
 
@@ -108,6 +111,7 @@ const host = Deno.env.get("HOST") || "0.0.0.0";
 
 await initializeCache();
 initializeWorkers();
+initializePotWorkers();
 
 console.log(`Server listening on http://${host}:${port}`);
 await serve(handler, { port: Number(port), hostname: host });

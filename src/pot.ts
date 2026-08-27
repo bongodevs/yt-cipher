@@ -9,8 +9,8 @@ import {
 } from "npm:bgutils-js@3.2.0";
 import { JSDOM, VirtualConsole } from "npm:jsdom@29";
 import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
-import { potCache, type PotCacheEntry } from "./potCache.ts";
-import { potColdStartTokens, potTokens } from "./metrics.ts";
+import type { PotTokens } from "./potCache.ts";
+import { isSessionBound } from "./potBinding.ts";
 
 const YT_BASE = "https://www.youtube.com";
 const TV_CONFIG_URL =
@@ -25,29 +25,7 @@ const CREATE_USE_YT_API = Deno.env.get("POT_CREATE_USE_YT_API") === "true";
 const GENERATEIT_USE_YT_API =
   Deno.env.get("POT_GENERATEIT_USE_YT_API") !== "false";
 
-interface YoutubeSessionData {
-  visitorDataToken: string;
-  visitorData: string;
-  videoIdToken?: string;
-  coldStartToken?: string;
-  expiresAt: Date;
-}
-
-const SESSION_BOUND_CLIENTS = new Set(["TV_SIMPLY"]);
-
-export function isSessionBound(client?: string): boolean {
-  if (!client) return false;
-  const name = client.toUpperCase();
-  return name.startsWith("IOS") || name.startsWith("ANDROID") ||
-    name.startsWith("TVHTML5") || SESSION_BOUND_CLIENTS.has(name);
-}
-
-/** Token TTL and per-binding reuse windows for the {@link potCache}. */
-const VISITOR_TTL_MS = 6 * 60 * 60 * 1000;
-const VIDEO_REUSE_MS = 150_000;
-const VISITOR_REUSE_MS = VISITOR_TTL_MS - 5 * 60 * 1000;
-
-/** A BotGuard challenge together with the request key that produced it (they must match). */
+/** A BotGuard challenge plus the request key that produced it. The two must match. */
 type ChallengeResult = {
   challenge: DescrambledChallenge;
   requestKey: string;
@@ -69,9 +47,8 @@ type VmFunctions = {
 };
 
 /**
- * Lenient parser for the object literals YouTube embeds in its HTML (`window.ytAtN({...})`):
- * unquoted keys, single-quoted strings, `\xNN` escapes and trailing commas are all legal there but
- * not in JSON.
+ * Parse the object literals YouTube inlines in its HTML. Unquoted keys, single-quoted strings,
+ * `\xNN` escapes and trailing commas are legal there but not in JSON.
  */
 function parseLooseJson(input: string): any {
   const normalized = input
@@ -91,38 +68,13 @@ function parseLooseJson(input: string): any {
     if (typeof value === "string" && /^\s*[{[]/.test(value)) {
       try {
         parsed[key] = JSON.parse(value);
-      } catch { /* leave the raw string in place */ }
+      } catch { /* keep the raw string */ }
     }
   }
   return parsed;
 }
 
-/**
- * Pull the bare visitor **ID** out of a `visitorData` blob.
- *
- * The cold-start packet binds to the visitor ID (or data-sync ID), not to the `visitorData`
- * protobuf that wraps it: bgutils caps the binding at 118 bytes and a full blob always exceeds
- * that. Field 1 of the protobuf is the visitor ID string, so decoding just that field is enough.
- */
-function visitorIdFrom(visitorData: string): string | undefined {
-  try {
-    const b64 = decodeURIComponent(visitorData)
-      .replace(/-/g, "+")
-      .replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
-
-    // Tag 0x0a = field 1, wire type 2 (length-delimited), followed by a single-byte length.
-    if (bytes[0] !== 0x0a) return undefined;
-    const length = bytes[1];
-    if (!length || bytes.length < 2 + length) return undefined;
-    return new TextDecoder().decode(bytes.subarray(2, 2 + length));
-  } catch {
-    return undefined;
-  }
-}
-
-/** Normalise the several shapes YouTube returns a `bgChallenge` in into one. */
+/** Fold the several shapes of a `bgChallenge` into one. */
 function toDescrambledChallenge(
   bgChallenge: any,
 ): DescrambledChallenge | undefined {
@@ -169,13 +121,22 @@ export class PoTokenManager {
         },
       );
 
-      Object.assign(globalThis, {
+      const globals = {
         window: dom.window,
         document: dom.window.document,
         location: dom.window.location,
         origin: dom.window.origin,
         navigator: dom.window.navigator,
-      });
+      };
+
+      // A worker global has location, origin and navigator as getters, so assigning them throws.
+      for (const [key, value] of Object.entries(globals)) {
+        Object.defineProperty(globalThis, key, {
+          value,
+          writable: true,
+          configurable: true,
+        });
+      }
       PoTokenManager.hasDom = true;
     }
   }
@@ -199,17 +160,10 @@ export class PoTokenManager {
   }
 
   /**
-   * The challenge program and the request key sent to `GenerateIT` must come from the *same*
-   * handshake — the key is a lookup into the server-side program descriptor table, so pairing a
-   * program from one surface with a key from another yields an integrity token YouTube's streaming
-   * backend will not attest (it mints fine, then parks the SABR session at
-   * `StreamProtectionStatus=2`). Each source below therefore returns its own key alongside its
-   * challenge.
-   *
-   * Ordered by observed success rate, mirroring the reference generator: the home page carries the
-   * live challenge (and lets us populate `yt.config_` for the VM), the TV config carries an explicit
-   * `challengeRequestKey`, WAA `Create` is the canonical WebPO handshake, and Innertube `att/get`
-   * is a last resort — it answers the *engagement* attestation flow rather than the WebPO one.
+   * The challenge program and the request key sent to `GenerateIT` have to come from the same
+   * handshake, so every source returns its own key. A mismatched pair still mints a token, but the
+   * streaming backend never attests it and the SABR session parks at `StreamProtectionStatus=2`.
+   * Sources are ordered by observed success rate.
    */
   private async getDescrambledChallenge(
     bgConfig: BgConfig,
@@ -325,8 +279,8 @@ export class PoTokenManager {
   }
 
   /**
-   * Innertube `att/get`. Kept last: it answers the engagement-attestation flow, so its program does
-   * not necessarily correspond to the WebPO request key we send to `GenerateIT`.
+   * Innertube `att/get`. Last resort: it answers the engagement attestation flow, so its program
+   * may not match the WebPO request key we send to `GenerateIT`.
    */
   private async challengeFromAttGet(
     bgConfig: BgConfig,
@@ -372,13 +326,9 @@ export class PoTokenManager {
   }
 
   /**
-   * Load the BotGuard interpreter and take a snapshot.
-   *
-   * The VM's init function `a` is called with the nine arguments the current program expects
-   * (telemetry callback, snapshot-mode flag and the logger table included). bgutils-js 3.2.0's own
-   * `BotGuardClient` still passes six, which the current VM accepts without throwing while
-   * producing a snapshot the streaming backend refuses to attest — so the call is made directly
-   * here instead.
+   * The VM init function `a` wants nine arguments for the current program. bgutils-js 3.2.0 passes
+   * six, which the VM accepts while producing a snapshot the streaming backend refuses to attest,
+   * so the call is made here instead.
    */
   private async loadVm(
     challenge: DescrambledChallenge,
@@ -416,8 +366,7 @@ export class PoTokenManager {
     ) =>
       resolveVmFunctions({ asyncSnapshot, shutdown, passEvent, checkCamera });
 
-    // The VM's Clearcut telemetry hooks (event log, client error count, payload size, latency,
-    // event count). It calls them positionally, so all five must be present.
+    // Clearcut telemetry hooks. The VM calls them positionally, so all five have to be there.
     const loggerFunctions = [() => {}, () => {}, () => {}, () => {}, () => {}];
 
     await vm.a(
@@ -501,8 +450,7 @@ export class PoTokenManager {
 
     if (!integrityToken) throw new Error("Unexpected empty integrity token");
 
-    // Retire the minter a little before the server-stated TTL rather than exactly on it, so an
-    // in-flight mint never lands on an expired integrity token.
+    // Retire the minter early so an in-flight mint never lands on an expired integrity token.
     const ttlSecs = Number(estimatedTtlSecs);
     const lifetimeSecs = Math.max(
       1,
@@ -526,37 +474,11 @@ export class PoTokenManager {
     return tokenMinter;
   }
 
-  /**
-   * Mint a token for `binding` (visitorData or videoId), reusing a cached one minted within the last
-   * `reuseMs`. Keyed by the binding, so session- and content-bound tokens never collide. `kind`
-   * ("visitor"/"video") only labels the {@link potTokens} metric.
-   */
-  private async mint(
-    minter: any,
-    binding: string,
-    reuseMs: number,
-    kind: string,
-  ): Promise<PotCacheEntry> {
-    const cached = potCache.get(binding);
-    if (cached && Date.now() - cached.mintedAt < reuseMs) {
-      potTokens.labels({ binding: kind, result: "reused" }).inc();
-      return cached;
-    }
-
-    const token = await minter.mintAsWebsafeString(binding);
-    if (!token) throw new Error("Unexpected empty POT");
-
-    const entry: PotCacheEntry = { token, mintedAt: Date.now() };
-    potCache.set(binding, entry);
-    potTokens.labels({ binding: kind, result: "minted" }).inc();
-    return entry;
-  }
-
   async generatePoToken(
     visitorData?: string,
     videoId?: string,
     client?: string,
-  ): Promise<YoutubeSessionData> {
+  ): Promise<PotTokens> {
     if (!visitorData) {
       visitorData = (await this.generateVisitorData()) || undefined;
       if (!visitorData) throw new Error("Unable to generate visitor data");
@@ -578,54 +500,23 @@ export class PoTokenManager {
       );
     }
 
-    const visitorEntry = await this.mint(
-      tokenMinter.minter,
-      visitorData,
-      VISITOR_REUSE_MS,
-      "visitor",
-    );
+    const visitorDataToken = await mint(tokenMinter.minter, visitorData);
 
-    let videoEntry: PotCacheEntry | undefined;
-    if (videoId) {
-      const sessionBound = isSessionBound(client);
-      videoEntry = await this.mint(
-        tokenMinter.minter,
-        sessionBound ? visitorData : videoId,
-        sessionBound ? VISITOR_REUSE_MS : VIDEO_REUSE_MS,
-        "video",
-      );
-    }
+    // A session bound client binds its video token to visitorData, so it is the visitor token.
+    const videoIdToken = !videoId
+      ? undefined
+      : isSessionBound(client)
+      ? visitorDataToken
+      : await mint(tokenMinter.minter, videoId);
 
-    // Bound to the session, never to the video: the cold-start format carries a visitor/data-sync
-    // identifier. Minted per response because the packet embeds the current time.
-    let coldStartToken: string | undefined;
-    const visitorId = visitorIdFrom(visitorData);
-    if (visitorId) {
-      try {
-        coldStartToken = BG.PoToken.generateColdStartToken(visitorId);
-        potColdStartTokens.labels({ result: "minted" }).inc();
-      } catch (e) {
-        potColdStartTokens.labels({ result: "failed" }).inc();
-        console.warn(
-          "Failed to create cold start token:",
-          e instanceof Error ? e.message : e,
-        );
-      }
-    }
-
-    const oldestMint = Math.min(
-      visitorEntry.mintedAt,
-      videoEntry?.mintedAt ?? Infinity,
-    );
-
-    return {
-      visitorDataToken: visitorEntry.token,
-      visitorData,
-      videoIdToken: videoEntry?.token,
-      coldStartToken,
-      expiresAt: new Date(oldestMint + VISITOR_TTL_MS),
-    };
+    return { visitorDataToken, visitorData, videoIdToken };
   }
+}
+
+async function mint(minter: any, binding: string): Promise<string> {
+  const token = await minter.mintAsWebsafeString(binding);
+  if (!token) throw new Error("Unexpected empty POT");
+  return token;
 }
 
 export const potManager = new PoTokenManager();

@@ -92,6 +92,9 @@ Environment Variables:
 - `OVERRIDE_PLAYER_ID` - Forces all requests to use a specific YouTube player script ID (eg. 1a2b3c4d).
 - `OVERRIDE_PLAYER_VARIANT` - Forces all requests to use a specific player variant. Available variants: `IAS`, `IAS_TCC`, `IAS_TCE`, `ES5`, `ES6`, `TV`, `TV_ES6`, `PHONE`, `EMBED`.
 - `POT_CACHE_SIZE` - Max number of minted PO tokens kept in memory. Default: `200`
+- `POT_WORKERS` - Number of workers minting PO tokens. Each one keeps its own BotGuard VM, so raising this costs memory. Default: `1`
+- `POT_MAX_PENDING` - Max queued PO token requests before the service answers `503`. Default: `256`
+- `POT_REQUEST_TIMEOUT` - Milliseconds to wait for a worker before answering `504`. Default: `30000`
 
 ## IPv6 Support
 
@@ -220,7 +223,7 @@ Resolves a raw stream URL by handling the signature and n-parameter decryption, 
 }
 ```
 
-### `POST /get_po_token`
+### `POST /generate_potoken`
 
 Mints a PO Token (proof of origin). Returns two tokens so the caller can pick the one its innertube client needs.
 
@@ -245,13 +248,17 @@ Mints a PO Token (proof of origin). Returns two tokens so the caller can pick th
   "visitorDataToken": "...",
   "visitorData": "...",
   "videoIdToken": "...",
+  "coldStartToken": "...",
   "expiresAt": "2026-01-01T00:00:00.000Z"
 }
 ```
 
 - `visitorDataToken` is always bound to `visitorData` (session bound).
-- `videoIdToken` is bound to `videoId` (content bound), **except** for session bound clients where it is bound to `visitorData` instead — in that case it is the same value as `visitorDataToken`.
+- `videoIdToken` is bound to `videoId` (content bound), except for session bound clients where it is bound to `visitorData` instead. In that case it is the same value as `visitorDataToken`.
+- `coldStartToken` is a bootstrap token YouTube only accepts while a SABR session reports `StreamProtectionStatus=2`. It embeds the current time, so it is minted fresh on every response and must not be cached.
 - `expiresAt` is measured from mint time, so it never overstates how much life a cached token has left.
+
+Minting runs on a pool of workers. Requests are answered `503` when the queue is full and `504` when a worker does not finish in time, both governed by the `POT_*` variables above.
 
 **Which token to use:**
 
