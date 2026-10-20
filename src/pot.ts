@@ -123,6 +123,8 @@ function toDescrambledChallenge(
 
 export class PoTokenManager {
   private static readonly REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
+  /** How many per-visitor integrity tokens a worker keeps before evicting the oldest. */
+  private static readonly MINTER_CACHE_LIMIT = 8;
   private static hasDom = false;
   private _minterCache: Map<string, TokenMinter> = new Map();
   private innertube?: Innertube;
@@ -497,7 +499,15 @@ export class PoTokenManager {
       `BotGuard integrity token minted (ttl=${ttlSecs}s, expires=${tokenMinter.expiry.toISOString()})`,
     );
 
-    this._minterCache.set("default", tokenMinter);
+    // Key by the visitor the integrity token was minted for: a worker serves many visitors, and an
+    // attestation bound to one is not interchangeable with another — the SABR backend refuses the
+    // mismatch and parks the session at `StreamProtectionStatus=2`.
+    this._minterCache.set(bgConfig.identifier, tokenMinter);
+    while (this._minterCache.size > PoTokenManager.MINTER_CACHE_LIMIT) {
+      const oldest = this._minterCache.keys().next().value;
+      if (oldest === undefined) break;
+      this._minterCache.delete(oldest);
+    }
     return tokenMinter;
   }
 
@@ -519,7 +529,7 @@ export class PoTokenManager {
       requestKey: PoTokenManager.REQUEST_KEY,
     };
 
-    let tokenMinter = this._minterCache.get("default");
+    let tokenMinter = this._minterCache.get(visitorData);
     if (!tokenMinter || new Date() >= tokenMinter.expiry) {
       const innertube = await this.getInnertube();
       tokenMinter = await this.generateTokenMinter(
